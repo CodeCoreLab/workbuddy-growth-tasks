@@ -33,6 +33,12 @@ workbuddy-checkin-ql/
     └── 9f2c1a7b-xxxx.json # 账号2 凭证
 ```
 
+> ⚠️ **`auths/` 内是明文登录凭证**：脚本写盘时会自动收紧权限（POSIX 目录 `0700` /
+> 文件 `0600`；Windows 去掉 ACL 继承，只留当前用户 / SYSTEM / Administrators），
+> 并采用原子写（临时文件 + `os.replace`）。Windows 上若 `icacls` 不可用则权限完全
+> 依赖 `auths/` 目录 ACL，**请勿把 `auths/` 放在共享可读目录**（如 `C:\Users\Public`）。
+> 手工拷入的凭据不会被自动收紧，请自行 `chmod 600` / `icacls ... /inheritance:r`。
+
 ## 🚀 快速开始（青龙三步）
 
 ### 1. 订阅仓库与上传脚本
@@ -192,6 +198,17 @@ python workbuddy_checkin.py all        # 状态 + 领取（调试）
 
 - Python 3.8+（仅标准库，无需 pip install 任何包）
 - 解密环节需本机安装 WorkBuddy 桌面端（仅在 `login` 时使用，青龙运行无需）
+
+## 🧪 回归测试（离线，不联网）
+
+凭证权限相关的离线回归测试放在仓库根 `tests/` 目录：
+
+```bash
+python -m pytest tests/test_credential_perms.py -q   # 方式一
+python tests/test_credential_perms.py                # 方式二（纯 unittest）
+```
+
+覆盖点：凭据文件/目录不可被其他用户读取、写入内容不被破坏、不残留 `.tmp` 中间文件。
 
 ## 🔒 免责声明
 

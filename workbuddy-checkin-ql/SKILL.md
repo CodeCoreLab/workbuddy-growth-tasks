@@ -34,6 +34,25 @@ license: MIT
 - 脚本按**自身所在目录**找 `auths/`，无需任何环境变量
 - Python 3.8+，`pip install` 什么都可以不装
 
+### 凭证文件权限模型（重要）
+
+`auths/<uid>.json` 是**明文登录凭证**，脚本写盘时会自动收紧权限：
+
+| 平台 | 目录 `auths/` | 凭证文件 `<uid>.json` |
+|------|--------------|------------------------|
+| POSIX (Linux/macOS) | `0700` | `0600`（仅属主可读写） |
+| Windows | 去掉 ACL 继承，只保留「当前用户 / SYSTEM / Administrators」 | 同左 |
+
+- 写入方式是**原子写**（临时文件 + `os.replace`），避免写到一半崩溃留下半截凭据文件
+- Windows 上 `icacls` 不可用、或授权失败时，脚本会打印 `⚠️` 提示并**保留原有继承权限**
+  （不会把文件改成「无继承也无显式权限」而把自己锁在门外）。此时文件权限完全依赖
+  `auths/` 目录的 ACL —— 所以 **`auths/` 目录本身也不能放在共享可读目录**
+  （例如 Windows 的 `C:\Users\Public`、共享盘的公共目录）。建议放在用户私有目录下。
+- Windows 上没有 POSIX 权限位，访问控制完全由 ACL 决定；父目录通常对 `Users` 组可读，
+  不收紧等于**同机其他用户可以读到你的登录凭证**。
+- 手工拷贝凭据进 `auths/`（不经脚本）时，权限不会被自动收紧，请自行
+  `icacls auths\<uid>.json /inheritance:r` 或 `chmod 600`。
+
 ## Agent 执行手册
 
 ### 1. 导入凭证（本机一次性）
@@ -129,4 +148,18 @@ json 进 `auths/`。
 
 - 全流程单轮 ~3.5 分钟（`RANDOM_SIGNIN=false` 时），exit=0
 - 新账号首轮：每号点亮 8 项成长任务，+1000 积分 +40 能量；等级 2→13
-- Token 续期自动完成，iat 起算 7 天内自动 RT 轮换回写
+- Token 续期自动完成，iat 起推 7 天内自动 RT 轮换回写
+
+## 回归测试（离线，不联网）
+
+凭证权限相关回归测试放在仓库根 `tests/` 目录：
+
+```bash
+# 方式一：pytest
+python -m pytest tests/test_credential_perms.py -q
+
+# 方式二：纯 unittest（无第三方依赖也能跑）
+python tests/test_credential_perms.py
+```
+
+测试内容：凭据文件/目录不可被其他用户读取、写入内容不被破坏、不残留 `.tmp` 中间文件。

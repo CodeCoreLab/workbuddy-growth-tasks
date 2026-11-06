@@ -368,13 +368,87 @@ def load_creds():
     return list(items.values())
 
 
+# ---------------------------------------------------------------------------
+# 凭据文件权限收紧
+#
+# auths/<uid>.json 里是 accessToken / refreshToken，属于长期有效的凭据。
+# 默认权限（POSIX 0644 / Windows 继承父目录 ACL）会让同机其他用户可读，
+# 因此写盘时统一收紧：
+#   · POSIX：0600（仅属主可读写）
+#   · Windows：去掉 ACL 继承，只保留当前用户 + SYSTEM + Administrators
+#     （Windows 没有 POSIX 权限位，访问控制完全由 ACL 决定。若 icacls 不可用，
+#      权限只能依赖 auths/ 目录本身的 ACL —— 因此 auths 目录也要收紧，
+#      且不应放在共享目录下。）
+# ---------------------------------------------------------------------------
+def _current_user_ident():
+    """当前用户的 icacls 授权标识（域账号带域名前缀，否则可能匹配到同名本地账号）。"""
+    name = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    if not name:
+        return ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    return (domain + "\\" + name) if domain else name
+
+
+def _restrict_acl(path, is_dir=False):
+    """收紧访问控制。返回是否成功（失败只打印提示，不阻断业务）。"""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700 if is_dir else 0o600)
+            return True
+        except OSError as e:
+            print(f"⚠️  收紧权限失败 {path}: {e}")
+            return False
+    ident = _current_user_ident()
+    if not ident:
+        print(f"⚠️  无法确定当前用户，跳过 ACL 收紧 {path}")
+        return False
+    grant = "(OI)(CI)F" if is_dir else "F"
+    # 顺序不能反：先显式授权，再去掉继承项。否则一旦授权失败，就会得到一个
+    # 「没有继承权限也没有显式权限」的文件，用户自己都打不开。
+    try:
+        p = subprocess.run(["icacls", path, "/grant",
+                            f"{ident}:{grant}", f"*S-1-5-18:{grant}", f"*S-1-5-32-544:{grant}"],
+                           capture_output=True)
+        if p.returncode != 0:
+            print(f"⚠️  ACL 授权失败（保留继承权限）{path}: "
+                  f"{(p.stdout + p.stderr).decode('mbcs', 'replace').strip()[:200]}")
+            return False
+        subprocess.run(["icacls", path, "/inheritance:r"], capture_output=True)
+        return True
+    except OSError as e:
+        print(f"⚠️  icacls 不可用，权限依赖目录 ACL {path}: {e}")
+        return False
+
+
+def _write_private_json(path, obj):
+    """原子写入 JSON 凭据文件，并收紧权限。"""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+    _restrict_acl(path)
+
+
 def save_session(uin, session):
-    """把（可能更新过的）会话回写 auths/<uid>.json（Token 轮换后调用）。"""
+    """把（可能更新过的）会话回写 auths/<uid>.json（Token 轮换后调用）。
+
+    凭据文件必须收紧权限：POSIX 用 0600（仅属主可读写），Windows 去掉 ACL
+    继承并只留当前用户 / SYSTEM / 管理员（Windows 无 POSIX 权限位，访问控制
+    由 ACL 决定；父目录通常对 Users 组可读，不收紧等于同机其他用户可读凭据）。
+    """
     try:
         os.makedirs(AUTH_DIR, exist_ok=True)
+        _restrict_acl(AUTH_DIR, is_dir=True)
         path = os.path.join(AUTH_DIR, f"{uin}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(session, f, ensure_ascii=False, indent=2)
+        _write_private_json(path, session)
         return True
     except OSError as e:
         print(f"⚠️  凭据回写失败（{uin}）: {e}")
@@ -524,6 +598,8 @@ def decrypt_session(session):
     if not exe:
         raise RuntimeError("未找到 WorkBuddy.exe（请在装有桌面端的机器上执行 login）")
     tmpdir = tempfile.mkdtemp(prefix="wb-decrypt-")
+    # 临时目录里会落地明文凭证（in.json / out.json），同样收紧访问控制
+    _restrict_acl(tmpdir, is_dir=True)
     try:
         in_path = os.path.join(tmpdir, "in.json")
         out_path = os.path.join(tmpdir, "out.json")
@@ -581,9 +657,9 @@ def do_login():
 
     uid = uid_of(session)
     os.makedirs(AUTH_DIR, exist_ok=True)
+    _restrict_acl(AUTH_DIR, is_dir=True)
     out = os.path.join(AUTH_DIR, f"{uid}.json")
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(session, f, ensure_ascii=False, indent=2)
+    _write_private_json(out, session)
 
     account = session.get("account") or {}
     nickname = account.get("nickname") or account.get("uid") or uid
